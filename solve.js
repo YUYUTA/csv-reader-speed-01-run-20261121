@@ -1,17 +1,26 @@
+function closingQuote(text, start) {
+  let quote = text.indexOf('"', start);
+  while (quote !== -1 && text.charCodeAt(quote + 1) === 34) {
+    quote = text.indexOf('"', quote + 2);
+  }
+  return quote;
+}
+
 export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
   const rows = [];
   const errors = [];
   let columns = null;
-  let width = -1;
+  let width = 0;
   let pos = text.charCodeAt(0) === 0xfeff ? 1 : 0;
   let line = 1;
+  const length = text.length;
 
-  const separator = /[,\r\n]/g;
-  const quotedPart = /["\r\n]/g;
+  const quotedChange = /""|\r\n?|\n/g;
+  let unmatchedFrom = length;
 
-  while (pos < text.length) {
+  while (pos < length) {
     const first = text.charCodeAt(pos);
     if (first === 10 || (first === 13 && text.charCodeAt(pos + 1) === 10)) {
       pos += first === 10 ? 1 : 2;
@@ -21,91 +30,79 @@ export function run(input) {
 
     const recordLine = line;
     const row = header && columns === null ? null : rows.length;
-    const fields = [];
+    const fields = new Array(width);
+    let count = 0;
     let quoted;
     let delimiter;
     do {
       const start = pos;
       quoted = text.charCodeAt(pos) === 34;
-      let value = '';
+      let prefix = '';
       let closed = false;
 
       if (quoted) {
-        let partStart = start + 1;
-        let quotedLines = 0;
-        quotedPart.lastIndex = partStart;
-
-        for (let match; (match = quotedPart.exec(text)) !== null;) {
-          const at = match.index;
-          const ch = text.charCodeAt(at);
-          if (ch === 34) {
-            value += text.slice(partStart, at);
-            if (text.charCodeAt(at + 1) !== 34) {
-              pos = at + 1;
-              line += quotedLines;
-              closed = true;
-              break;
-            }
-            value += '"';
-            quotedPart.lastIndex = partStart = at + 2;
-          } else {
-            quotedLines++;
-            if (ch === 13) {
-              value += text.slice(partStart, at) + '\n';
-              quotedPart.lastIndex = partStart = at + (text.charCodeAt(at + 1) === 10 ? 2 : 1);
-            }
-          }
+        let end;
+        if (pos < unmatchedFrom) {
+          end = closingQuote(text, pos + 1);
+          if (end === -1) unmatchedFrom = pos;
+        } else {
+          // After a failed search, all subsequent quote runs have even lengths.
+          // A new opener can close only inside its own run.
+          end = pos + 1;
+          while (text.charCodeAt(end) === 34 && text.charCodeAt(end + 1) === 34) end += 2;
+          if (text.charCodeAt(end) !== 34) end = -1;
         }
-        if (!closed) {
+
+        if (end === -1) {
           errors.push({ code: 'unterminated_quote', line: recordLine, row });
-          pos = start;
-          value = '';
+        } else {
+          prefix = text.slice(start + 1, end).replace(quotedChange, part => {
+            if (part === '""') return '"';
+            line++;
+            return '\n';
+          });
+          pos = end + 1;
+          closed = true;
         }
       }
 
-      const quotedLength = value.length;
-      separator.lastIndex = pos;
-      while (true) {
-        const match = separator.exec(text);
-        if (match === null) {
-          value += text.slice(pos);
-          pos = text.length;
-          delimiter = 0;
-          break;
+      let partStart = pos;
+      let value = prefix;
+      while (pos < length) {
+        const ch = text.charCodeAt(pos);
+        if (ch === 44 || ch === 10) break;
+        if (ch === 13) {
+          if (text.charCodeAt(pos + 1) === 10) break;
+          value += text.slice(partStart, pos);
+          partStart = pos + 1;
+          errors.push({ code: 'stray_cr', line: recordLine, row });
         }
-
-        const at = match.index;
-        value += text.slice(pos, at);
-        delimiter = text.charCodeAt(at);
-        pos = at + 1;
-        if (delimiter !== 13) break;
-        if (text.charCodeAt(pos) === 10) {
-          pos++;
-          delimiter = 10;
-          break;
-        }
-
-        errors.push({ code: 'stray_cr', line: recordLine, row });
+        pos++;
       }
-
-      if (closed && value.length !== quotedLength) {
+      value += text.slice(partStart, pos);
+      if (closed && value.length !== prefix.length) {
         errors.push({ code: 'quote_junk', line: recordLine, row });
       }
+      delimiter = text.charCodeAt(pos++);
+      if (delimiter === 13) {
+        pos++;
+        delimiter = 10;
+      }
       if (delimiter === 10) line++;
-      fields.push(value);
+      fields[count++] = value;
     } while (delimiter === 44);
 
-    if (fields.length === 1 && fields[0] === '' && !quoted) continue;
-    if (width === -1) width = fields.length;
+    if (count === 1 && fields[0] === '' && !quoted) continue;
+    if (width === 0) width = count;
     if (row === null) {
       columns = fields;
       continue;
     }
 
-    if (fields.length < width) {
-      errors.push({ code: 'short_row', line: recordLine, row, fields: fields.length });
-      while (fields.length < width) fields.push('');
-    } else if (fields.length > width) {
+    if (count < width) {
+      errors.push({ code: 'short_row', line: recordLine, row, fields: count });
+      while (count < width) fields[count++] = '';
+    } else if (count > width) {
       errors.push({ code: 'long_row', line: recordLine, row, extra: fields.splice(width) });
     }
     rows.push(fields);
