@@ -1,36 +1,72 @@
 import { isUtf8 } from 'node:buffer';
-import { closeSync, openSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { setFlagsFromString } from 'node:v8';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { run } from './solve.js';
 
-setFlagsFromString('--no-incremental-marking');
+const CASE_START = Buffer.from('{"id":"');
+const TEXT_START = Buffer.from(',"input":{"text":"');
+const HEADER_START = Buffer.from(',"header":');
+const TRUE_END = Buffer.from('true}}');
+const FALSE_END = Buffer.from('false}}');
+const QUOTE = 34;
+const BACKSLASH = 92;
+
+function matchesAt(bytes, marker, pos) {
+  return bytes.subarray(pos, pos + marker.length).equals(marker);
+}
+
+function stringEnd(bytes, pos) {
+  while (true) {
+    const quote = bytes.indexOf(QUOTE, pos);
+    if (quote === -1) return -1;
+
+    let before = quote - 1;
+    while (bytes[before] === BACKSLASH) before--;
+    if ((quote - before) % 2 === 1) return quote;
+    pos = quote + 1;
+  }
+}
+
+// Extract views of the JSON string contents from a compact envelope. The
+// general decoder handles other layouts and Unicode escapes, which can encode
+// CSV delimiters as well as field contents.
+function compactCases(bytes) {
+  if (bytes[0] !== 91 || bytes[bytes.length - 1] !== 93 ||
+      bytes.includes('\\u') || !isUtf8(bytes)) return null;
+
+  const cases = [];
+  let pos = 1;
+  if (bytes.length === 2) return cases;
+
+  do {
+    if (!matchesAt(bytes, CASE_START, pos)) return null;
+    const idEnd = stringEnd(bytes, pos + CASE_START.length);
+    if (idEnd === -1 || !matchesAt(bytes, TEXT_START, idEnd + 1)) return null;
+
+    const start = idEnd + 1 + TEXT_START.length;
+    const end = stringEnd(bytes, start);
+    if (end === -1 || !matchesAt(bytes, HEADER_START, end + 1)) return null;
+
+    pos = end + 1 + HEADER_START.length;
+    const header = matchesAt(bytes, TRUE_END, pos);
+    if (!header && !matchesAt(bytes, FALSE_END, pos)) return null;
+
+    cases.push({ text: bytes.subarray(start, end), header });
+    pos += header ? TRUE_END.length : FALSE_END.length;
+  } while (bytes[pos++] === 44);
+
+  return pos === bytes.length && bytes[pos - 1] === 93 ? cases : null;
+}
 
 const inputDirectory = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const outputDirectory = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const bytes = readFileSync(join(inputDirectory, 'cases.json'));
+const bytes = readFileSync(inputDirectory + '/cases.json');
+const cases = compactCases(bytes) ?? JSON.parse(bytes.toString('utf8')).map(({ input }) => input);
 
-// ASCII CSV syntax never occurs within a multibyte UTF-8 character. Without
-// JSON Unicode escapes, a Latin-1 view preserves the original bytes through
-// CSV parsing and serialization, including non-ASCII field contents.
-const byteView = !bytes.includes('\\u') && isUtf8(bytes);
-const encoding = byteView ? 'latin1' : 'utf8';
-const cases = JSON.parse(bytes.toString(encoding));
-
-const output = openSync(join(outputDirectory, 'answers.json'), 'w');
-try {
-  writeFileSync(output, '[');
-  for (let i = 0; i < cases.length; i++) {
-    const { input } = cases[i];
-    const text = input.text;
-    // In the byte view, strip the leading BOM using its UTF-8 bytes.
-    const answer = byteView && typeof text === 'string' && text.startsWith('\xef\xbb\xbf')
-      ? run({ text: text.slice(3), header: input.header })
-      : run(input);
-    if (i !== 0) writeFileSync(output, ',');
-    writeFileSync(output, JSON.stringify(answer), encoding);
-  }
-  writeFileSync(output, ']');
-} finally {
-  closeSync(output);
+const destination = { bytes: Buffer.allocUnsafe(bytes.length * 3 + 128), offset: 1 };
+destination.bytes[0] = 91;
+for (let i = 0; i < cases.length; i++) {
+  if (i !== 0) destination.bytes[destination.offset++] = 44;
+  run(cases[i], destination);
 }
+destination.bytes[destination.offset++] = 93;
+writeFileSync(outputDirectory + '/answers.json', destination.bytes.subarray(0, destination.offset));
