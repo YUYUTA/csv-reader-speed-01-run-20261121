@@ -16,9 +16,58 @@ function growBuffer(out, written, needed) {
   return next;
 }
 
+// The span readers copy four bytes at a time. XOR makes matching bytes zero.
+// Subtraction can mark additional bytes after the first match, so use the
+// least significant marked bit, which is the first byte in little endian.
+// A word store can extend past that byte. Later writes replace those bytes
+// before the output cursor advances past them.
+function copyQuotedSpan(bytes, out, source, target, pos, written, length) {
+  const delta = written - pos;
+  const lastWord = length - 4;
+  while (pos <= lastWord) {
+    const word = source.getInt32(pos, true);
+    const escapes = word ^ 0x5c5c5c5c;
+    const markers = (escapes - 0x01010101) & ~escapes;
+    const mask = markers & 0x80808080;
+    target.setInt32(pos + delta, word, true);
+    if (mask) return pos + ((31 - Math.clz32(mask & -mask)) >>> 3);
+    pos += 4;
+  }
+  while (pos < length) {
+    const byte = bytes[pos];
+    if (byte === BACKSLASH) break;
+    out[pos + delta] = byte;
+    pos++;
+  }
+  return pos;
+}
+
+function copyBareSpan(bytes, out, source, target, pos, written, length) {
+  const delta = written - pos;
+  const lastWord = length - 4;
+  while (pos <= lastWord) {
+    const word = source.getInt32(pos, true);
+    const escapes = word ^ 0x5c5c5c5c;
+    const commas = word ^ 0x2c2c2c2c;
+    const markers = ((escapes - 0x01010101) & ~escapes) |
+                    ((commas - 0x01010101) & ~commas);
+    const mask = markers & 0x80808080;
+    target.setInt32(pos + delta, word, true);
+    if (mask) return pos + ((31 - Math.clz32(mask & -mask)) >>> 3);
+    pos += 4;
+  }
+  while (pos < length) {
+    const byte = bytes[pos];
+    if (byte === BACKSLASH || byte === COMMA) break;
+    out[pos + delta] = byte;
+    pos++;
+  }
+  return pos;
+}
+
 // If the quote never closes, the caller resumes at the original opener.
 // Earlier writes past the caller's cursor are overwritten.
-function copyQuoted(bytes, pos, out, written, result, knownUnmatched) {
+function copyQuoted(bytes, pos, out, written, result, knownUnmatched, source, target) {
   let addedLines = 0;
   if (knownUnmatched) {
     // After an unmatched opener, all later runs of quotes have even lengths.
@@ -34,12 +83,11 @@ function copyQuoted(bytes, pos, out, written, result, knownUnmatched) {
   } else {
     const length = bytes.length;
     while (true) {
+      const next = copyQuotedSpan(bytes, out, source, target, pos, written, length);
+      written += next - pos;
+      pos = next;
       if (pos === length) return false;
-      const byte = bytes[pos++];
-      if (byte !== BACKSLASH) {
-        out[written++] = byte;
-        continue;
-      }
+      pos++;
       const escaped = bytes[pos++];
       if (escaped === QUOTE) {
         if (!quoteAt(bytes, pos)) break;
@@ -72,6 +120,8 @@ function emitRecord(bytes, length, out, written, width, row, errors, state) {
   let line = state.line;
   const recordLine = line;
   const quoted = state.quoted;
+  const source = state.source;
+  const target = state.target;
   let unmatchedFrom = state.unmatchedFrom;
   const contentStart = written;
   let fieldStart = pos;
@@ -80,6 +130,10 @@ function emitRecord(bytes, length, out, written, width, row, errors, state) {
   let keptEnd = 0;
 
   while (pos < length) {
+    const next = copyBareSpan(bytes, out, source, target, pos, written, length);
+    written += next - pos;
+    pos = next;
+    if (pos === length) break;
     const byte = bytes[pos++];
     if (byte === COMMA) {
       if (endOfQuote !== -1 && written > endOfQuote) recordError(errors, 'quote_junk', recordLine, row);
@@ -91,11 +145,6 @@ function emitRecord(bytes, length, out, written, width, row, errors, state) {
       endOfQuote = -1;
       continue;
     }
-    if (byte !== BACKSLASH) {
-      out[written++] = byte;
-      continue;
-    }
-
     const escaped = bytes[pos++];
     if (escaped === ESCAPED_LF) {
       line++;
@@ -112,7 +161,7 @@ function emitRecord(bytes, length, out, written, width, row, errors, state) {
     }
     if (escaped === QUOTE && pos - 2 === fieldStart) {
       const knownUnmatched = fieldStart >= unmatchedFrom;
-      if (copyQuoted(bytes, pos, out, written, quoted, knownUnmatched)) {
+      if (copyQuoted(bytes, pos, out, written, quoted, knownUnmatched, source, target)) {
         pos = quoted.pos;
         written = quoted.written;
         line += quoted.lines;
@@ -145,7 +194,10 @@ function serializeCase(bytes, header, destination) {
   let pos = bytes[0] === 239 && bytes[1] === 187 && bytes[2] === 191 ? 3 : 0;
   let out = destination.bytes;
   let written = destination.offset;
-  if (written + 32 > out.length) out = growBuffer(out, written, written + 32);
+  // There are at most three bytes of output per input byte, plus fixed
+  // framing and short-row padding. Reserve extra space only on padding.
+  const capacity = written + length * 3 + 64;
+  if (capacity > out.length) out = growBuffer(out, written, capacity);
   written += out.write('{"columns":', written, 'ascii');
   if (!header) written += out.write('null,"rows":[', written, 'ascii');
 
@@ -153,16 +205,14 @@ function serializeCase(bytes, header, destination) {
   const state = {
     pos, line: 1, unmatchedFrom: length, count: 0, keptEnd: 0,
     quoted: { pos: 0, written: 0, lines: 0 },
+    source: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+    target: new DataView(out.buffer, out.byteOffset, out.byteLength),
   };
   let row = header ? -1 : 0;
   let width = 0;
 
   while (pos < length) {
     const recordLine = state.line;
-    // Commas can expand to three bytes. Reserve padding separately once the
-    // full record's field count is known.
-    const recordCapacity = written + (length - pos) * 3 + 32;
-    if (recordCapacity > out.length) out = growBuffer(out, written, recordCapacity);
     const recordStart = written;
     if (row > 0) out[written++] = COMMA;
     out[written++] = OPEN_ARRAY;
@@ -185,8 +235,11 @@ function serializeCase(bytes, header, destination) {
       written = keptEnd;
     } else if (count < width) {
       recordError(errors, 'short_row', recordLine, row, `,"fields":${count}`);
-      const paddedCapacity = written + (width - count) * 3 + 16;
-      if (paddedCapacity > out.length) out = growBuffer(out, written, paddedCapacity);
+      const paddedCapacity = written + (width - count + length - pos) * 3 + 64;
+      if (paddedCapacity > out.length) {
+        out = growBuffer(out, written, paddedCapacity);
+        state.target = new DataView(out.buffer, out.byteOffset, out.byteLength);
+      }
       while (count++ < width) {
         out[written++] = COMMA;
         out[written++] = QUOTE;
